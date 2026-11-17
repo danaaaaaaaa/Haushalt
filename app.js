@@ -36,6 +36,28 @@ function h(tag, props = {}, ...kids) {
 }
 
 // =====================================================================
+//  Icons: schlichte Linien-Symbole als SVG (statt Emojis)
+// =====================================================================
+class Icons {
+  static PATHS = {
+    home: '<path d="M3 11.5 12 4l9 7.5"/><path d="M5.5 10v9.5h13V10"/><path d="M10 19.5v-5h4v5"/>',
+    tasks: '<path d="M9.5 6H20M9.5 12H20M9.5 18H20"/><path d="m3.5 6 1.3 1.3L7 4.8M3.5 12l1.3 1.3L7 10.8M3.5 18l1.3 1.3L7 16.8"/>',
+    cart: '<circle cx="9" cy="20" r="1.3"/><circle cx="18" cy="20" r="1.3"/><path d="M2.5 3.5h3l2.4 11.2a1 1 0 0 0 1 .8h8.8a1 1 0 0 0 1-.8L20.5 8H6"/>',
+    settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+    close: '<path d="M6 6l12 12M18 6 6 18"/>'
+  };
+  // Liefert ein fertiges Element, Farbe folgt der Textfarbe (currentColor)
+  static get(name, size = 22) {
+    const el = document.createElement("span");
+    el.className = "icon";
+    el.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${Icons.PATHS[name]}</svg>`;
+    return el;
+  }
+}
+
+// =====================================================================
 //  Session: Haushaltscode (wer denselben Code hat, teilt dieselben Daten)
 // =====================================================================
 class Session {
@@ -69,13 +91,20 @@ class Repository {
   }
   col(name) { return collection(this.db, "households", this.code, name); }
   ref(name, id) { return doc(this.db, "households", this.code, name, id); }
-  fire(promise) { promise.catch((e) => console.error("Speichern fehlgeschlagen:", e)); }
+  // Fehler sichtbar machen: App setzt hier eine Funktion, die ein rotes Banner zeigt
+  static onError = null;
+  static report(text, err) {
+    console.error(text, err);
+    Repository.onError?.(`${text} ${err?.code || ""} ${err?.message || ""}`.trim());
+  }
+
+  fire(promise) { promise.catch((e) => Repository.report("Speichern fehlgeschlagen:", e)); }
 
   // Live-Abo: callback wird bei jeder Änderung (auch von anderen iPhones) aufgerufen
   listen(name, callback) {
     const stop = onSnapshot(this.col(name), (snap) => {
       callback(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-    }, (err) => console.error("Lesefehler:", err));
+    }, (err) => Repository.report("Lesefehler:", err));
     this.unsubscribers.push(stop);
   }
   stop() { this.unsubscribers.forEach((s) => s()); this.unsubscribers = []; }
@@ -191,9 +220,10 @@ class ShoppingView {
 
     this.el = h("section", { class: "content" },
       h("form", { class: "add-row", onsubmit: (e) => { e.preventDefault(); this.add(this.input.value); } },
-        this.input, h("button", { class: "btn primary", type: "submit" }, "＋")),
+        this.input, h("button", { class: "btn primary add-btn", type: "submit", "aria-label": "Hinzufügen" }, Icons.get("plus", 22))),
       this.chipTitle, this.chipBox, this.listBox);
 
+    this.render(); // sofort leeren Zustand zeigen, bis Daten eintreffen
     repo.listen("items", (list) => { this.items = list; this.render(); });
     repo.listen("suggestions", (list) => { this.suggestions = list; this.renderChips(); });
   }
@@ -233,7 +263,7 @@ class ShoppingView {
     const open = this.items.filter((i) => !i.done).sort((a, b) => a.createdAt - b.createdAt);
     const done = this.items.filter((i) => i.done).sort((a, b) => a.createdAt - b.createdAt);
     const rows = [...open, ...done].map((i) => this.row(i));
-    this.listBox.replaceChildren(...(rows.length ? rows : [h("div", { class: "empty" }, "Die Liste ist leer 🎉")]));
+    this.listBox.replaceChildren(...(rows.length ? rows : [h("div", { class: "empty" }, "Die Liste ist leer")]));
     if (done.length) {
       this.listBox.append(h("button", { class: "btn soft block", style: "margin-top:10px",
         onclick: () => this.repo.clearDone(done.map((d) => d.id)) }, `Erledigte entfernen (${done.length})`));
@@ -243,9 +273,9 @@ class ShoppingView {
 
   row(item) {
     return h("div", { class: "item" + (item.done ? " done" : "") },
-      h("button", { class: "check", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.done ? "✓" : ""),
+      h("button", { class: "check", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.done ? Icons.get("check", 15) : null),
       h("button", { class: "label", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.name),
-      h("button", { class: "del", onclick: () => this.repo.deleteItem(item.id) }, "✕"));
+      h("button", { class: "del", onclick: () => this.repo.deleteItem(item.id) }, Icons.get("close", 18)));
   }
 }
 
@@ -265,7 +295,8 @@ class TasksView {
     this.listBox = h("div", { class: "content", style: "padding:0" });
     this.el = h("section", { class: "content hidden" },
       this.scoreBox, this.listBox,
-      h("button", { class: "btn primary block", onclick: () => this.openEditor() }, "＋ Aufgabe hinzufügen"));
+      h("button", { class: "btn primary block", onclick: () => this.openEditor() }, Icons.get("plus", 20), "Aufgabe hinzufügen"));
+    this.render(); // sofort Score-Bereich zeigen, bis Daten eintreffen
     repo.listen("tasks", (list) => { this.tasks = list; this.render(); });
   }
 
@@ -310,7 +341,7 @@ class TasksView {
         h("button", { class: "task-name", onclick: () => this.openEditor(task) }, task.name)),
       h("div", { class: "bar" }, h("i", { class: state, style: `width:${width}%` })),
       h("div", { class: "task-info" }, `${ScoreCalculator.describe(task, now)} · ${ScoreCalculator.intervalText(task)}`),
-      h("button", { class: "btn soft block", onclick: () => this.repo.completeTask(task.id) }, "✓ Erledigt"));
+      h("button", { class: "btn soft block", onclick: () => this.repo.completeTask(task.id) }, Icons.get("check", 18), "Erledigt"));
   }
 
   addExamples() {
@@ -380,7 +411,7 @@ class App {
   }
 
   showMessage(title, text) {
-    this.root.replaceChildren(h("div", { class: "welcome" }, h("div", { class: "logo" }, "⚙️"), h("h1", {}, title), h("p", { class: "hint" }, text)));
+    this.root.replaceChildren(h("div", { class: "welcome" }, h("div", { class: "logo" }, Icons.get("settings", 40)), h("h1", {}, title), h("p", { class: "hint" }, text)));
   }
 
   // --- Startbildschirm: neuen Haushalt anlegen oder beitreten ---
@@ -392,7 +423,7 @@ class App {
       Session.set(code); this.showMain(code);
     };
     this.root.replaceChildren(h("div", { class: "welcome" },
-      h("div", { class: "logo" }, "🏡"),
+      h("div", { class: "logo" }, Icons.get("home", 44)),
       h("h1", {}, "Willkommen"),
       h("p", { class: "hint" }, "Lege einen neuen Haushalt an oder tritt mit dem Code einer anderen Person bei."),
       h("button", { class: "btn primary block", onclick: () => { const c = Session.generate(); Session.set(c); this.showMain(c); } }, "Neuen Haushalt erstellen"),
@@ -410,16 +441,20 @@ class App {
     this.title = h("h1", {}, "Haushalt");
     this.sub = h("div", { class: "sub" });
     const header = h("div", { class: "header" }, h("div", {}, this.title, this.sub),
-      h("button", { class: "icon-btn", onclick: () => this.openSettings(code) }, "⚙︎"));
+      h("button", { class: "icon-btn", onclick: () => this.openSettings(code) }, Icons.get("settings", 22)));
 
     this.tabButtons = {
-      tasks: h("button", { class: "tab", onclick: () => this.select("tasks") }, h("span", { class: "ico" }, "🧹"), "Haushalt"),
-      shopping: h("button", { class: "tab", onclick: () => this.select("shopping") }, h("span", { class: "ico" }, "🛒"), "Einkauf")
+      tasks: h("button", { class: "tab", onclick: () => this.select("tasks") }, Icons.get("tasks", 24), "Haushalt"),
+      shopping: h("button", { class: "tab", onclick: () => this.select("shopping") }, Icons.get("cart", 24), "Einkauf")
     };
     const tabbar = h("nav", { class: "tabbar" }, this.tabButtons.tasks, this.tabButtons.shopping);
     this.offline = h("div", { class: "status hidden" }, "Offline");
 
-    this.root.replaceChildren(this.offline, header, this.tasks.el, this.shopping.el, tabbar);
+    // Rotes Fehlerbanner (zeigt z. B. "permission-denied", wenn die Firestore-Regeln fehlen)
+    this.errorBox = h("div", { class: "error-banner hidden", onclick: () => this.errorBox.classList.add("hidden") });
+    Repository.onError = (text) => { this.errorBox.textContent = text; this.errorBox.classList.remove("hidden"); };
+
+    this.root.replaceChildren(this.offline, this.errorBox, header, this.tasks.el, this.shopping.el, tabbar);
     this.select(localStorage.getItem("haushalt-tab") || "tasks");
 
     // Ampel regelmäßig aktualisieren (Zeit vergeht auch ohne Änderungen)
