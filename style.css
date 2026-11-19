@@ -35,7 +35,7 @@
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html { background: var(--bg); }
-html, body { margin: 0; }
+html, body { margin: 0; touch-action: manipulation; -webkit-text-size-adjust: 100%; } /* kein Doppeltipp-Zoom */
 body {
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", sans-serif;
@@ -135,10 +135,12 @@ input, select { font: inherit; font-size: 16px; color: var(--text); }
 .overlay { position: fixed; inset: 0; background: rgba(8, 14, 30, 0.30); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); display: flex; align-items: flex-end; justify-content: center; z-index: 10; }
 .sheet {
   width: calc(100% - 16px); max-width: 544px; margin-bottom: calc(8px + env(safe-area-inset-bottom));
-  background: var(--glass-strong); border-radius: 32px; padding: 12px 20px 22px;
+  background: var(--glass-strong); border-radius: 32px; padding: 4px 20px 22px;
   display: flex; flex-direction: column; gap: 14px; box-shadow: var(--shadow);
 }
-.sheet::before { content: ""; width: 38px; height: 5px; border-radius: 3px; background: var(--line); align-self: center; }
+/* Griff zum Schließen: großer Touch-Bereich, sichtbar ist nur der schmale Balken */
+.grabber { align-self: stretch; padding: 10px 0 8px; touch-action: none; cursor: grab; }
+.grabber::before { content: ""; display: block; width: 38px; height: 5px; border-radius: 3px; background: var(--muted); opacity: .45; margin: 0 auto; }
 .sheet h3 { margin: 0; font-size: 21px; letter-spacing: -0.3px; }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field label { font-size: 13px; color: var(--muted); font-weight: 600; }

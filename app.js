@@ -46,7 +46,8 @@ class Icons {
     settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
-    close: '<path d="M6 6l12 12M18 6 6 18"/>'
+    close: '<path d="M6 6l12 12M18 6 6 18"/>',
+    edit: '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 8.5 3 3"/>'
   };
   // Liefert ein fertiges Element, Farbe folgt der Textfarbe (currentColor)
   static get(name, size = 22) {
@@ -119,6 +120,7 @@ class Repository {
   }
   setItemDone(id, done) { this.fire(updateDoc(this.ref("items", id), { done })); }
   deleteItem(id) { this.fire(deleteDoc(this.ref("items", id))); }
+  renameItem(id, name) { this.fire(updateDoc(this.ref("items", id), { name })); }
   clearDone(ids) {
     const batch = writeBatch(this.db);
     ids.forEach((id) => batch.delete(this.ref("items", id)));
@@ -196,11 +198,44 @@ class ScoreCalculator {
 class Modal {
   static open(...content) {
     Modal.close();
-    const overlay = h("div", { class: "overlay", id: "modal", onclick: (e) => { if (e.target === overlay) Modal.close(); } },
-      h("div", { class: "sheet" }, ...content));
+    const sheet = h("div", { class: "sheet" });
+    const overlay = h("div", { class: "overlay", id: "modal", onclick: (e) => { if (e.target === overlay) Modal.close(); } }, sheet);
+    sheet.append(Modal.grabber(sheet, overlay), ...content);
     document.body.append(overlay);
   }
   static close() { document.getElementById("modal")?.remove(); }
+
+  // Griff oben am Dialog: nach unten ziehen (oder antippen) schließt das Fenster,
+  // bei zu kurzem Ziehen springt es zurück
+  static grabber(sheet, overlay) {
+    const grab = h("div", { class: "grabber", role: "button", "aria-label": "Schließen" });
+    let startY = null, dy = 0;
+
+    grab.addEventListener("pointerdown", (e) => {
+      startY = e.clientY; dy = 0;
+      grab.setPointerCapture(e.pointerId);
+      sheet.style.transition = "none";
+    });
+    grab.addEventListener("pointermove", (e) => {
+      if (startY === null) return;
+      dy = Math.max(0, e.clientY - startY); // nur nach unten
+      sheet.style.transform = `translateY(${dy}px)`;
+    });
+    const finish = (cancelled) => {
+      if (startY === null) return;
+      startY = null;
+      sheet.style.transition = "transform .2s ease";
+      if (!cancelled && (dy > 80 || dy < 4)) { // weit gezogen oder nur angetippt -> schließen
+        sheet.style.transform = "translateY(110%)";
+        setTimeout(() => overlay.remove(), 180);
+      } else {
+        sheet.style.transform = ""; // zurückfedern
+      }
+    };
+    grab.addEventListener("pointerup", () => finish(false));
+    grab.addEventListener("pointercancel", () => finish(true));
+    return grab;
+  }
 }
 
 // =====================================================================
@@ -211,6 +246,8 @@ class ShoppingView {
     this.repo = repo;
     this.items = [];
     this.suggestions = [];
+    this.loaded = { items: false, suggestions: false }; // Daten schon eingetroffen?
+    this.queue = [];                                    // wartende Aktionen (z. B. Schnell-Hinzufügen)
 
     this.input = h("input", { type: "text", placeholder: "Was wird gebraucht?", autocomplete: "off", autocapitalize: "sentences", enterkeyhint: "done" });
     this.input.addEventListener("input", () => this.renderChips());
@@ -224,8 +261,26 @@ class ShoppingView {
       this.chipTitle, this.chipBox, this.listBox);
 
     this.render(); // sofort leeren Zustand zeigen, bis Daten eintreffen
-    repo.listen("items", (list) => { this.items = list; this.render(); });
-    repo.listen("suggestions", (list) => { this.suggestions = list; this.renderChips(); });
+    repo.listen("items", (list) => {
+      this.items = list; this.loaded.items = true; this.render();
+      if (this.loaded.suggestions) this.flush();
+    });
+    repo.listen("suggestions", (list) => {
+      this.suggestions = list; this.loaded.suggestions = true; this.renderChips();
+      if (this.loaded.items) this.flush();
+    });
+  }
+
+  // Führt eine Aktion erst aus, wenn Liste und Vorschläge geladen sind (spätestens nach 3 s)
+  whenLoaded(action) {
+    if (this.loaded.items && this.loaded.suggestions) return action();
+    this.queue.push(action);
+    setTimeout(() => this.flush(), 3000);
+  }
+  flush() {
+    const waiting = this.queue;
+    this.queue = [];
+    waiting.forEach((action) => action());
   }
 
   // Neuen Artikel hinzufügen (Doppelte auf der offenen Liste werden ignoriert)
@@ -275,7 +330,27 @@ class ShoppingView {
     return h("div", { class: "item" + (item.done ? " done" : "") },
       h("button", { class: "check", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.done ? Icons.get("check", 15) : null),
       h("button", { class: "label", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.name),
-      h("button", { class: "del", onclick: () => this.repo.deleteItem(item.id) }, Icons.get("close", 18)));
+      h("button", { class: "del", "aria-label": "Bearbeiten", onclick: () => this.openEditor(item) }, Icons.get("edit", 18)),
+      h("button", { class: "del", "aria-label": "Löschen", onclick: () => this.repo.deleteItem(item.id) }, Icons.get("close", 18)));
+  }
+
+  // Dialog zum Umbenennen eines Eintrags (leere Eingabe ändert nichts)
+  openEditor(item) {
+    const input = h("input", { type: "text", value: item.name, autocomplete: "off", autocapitalize: "sentences", enterkeyhint: "done" });
+    const save = () => {
+      let name = input.value.trim();
+      if (name) {
+        name = name.charAt(0).toUpperCase() + name.slice(1);
+        if (name !== item.name) this.repo.renameItem(item.id, name);
+      }
+      Modal.close();
+    };
+    Modal.open(
+      h("h3", {}, "Eintrag bearbeiten"),
+      h("form", { class: "field", onsubmit: (e) => { e.preventDefault(); save(); } }, input),
+      h("button", { class: "btn primary block", onclick: save }, "Speichern"),
+      h("button", { class: "btn block", onclick: () => Modal.close() }, "Abbrechen"));
+    setTimeout(() => input.focus(), 50);
   }
 }
 
@@ -390,6 +465,7 @@ class App {
 
   async start() {
     this.registerServiceWorker();
+    this.disableZoom();
     if (firebaseConfig.apiKey.startsWith("DEIN")) {
       return this.showMessage("Firebase noch nicht eingerichtet", "Trage deine Firebase-Daten in firebase-config.js ein (siehe README.md, Schritt 1).");
     }
@@ -402,8 +478,30 @@ class App {
       console.error(e);
       return this.showMessage("Anmeldung fehlgeschlagen", "Beim ersten Start wird Internet benötigt. Prüfe außerdem, ob „Anonym“ in Firebase Authentication aktiviert ist.");
     }
+    // Schnellzugriff per Link, z. B. für einen Kurzbefehl: ?code=XXXXXXXXXXXX&add=Milch
+    const params = new URLSearchParams(location.search);
+    const linkCode = Session.normalize(params.get("code") || "");
+    if (linkCode.length === 12 && !Session.get()) Session.set(linkCode);
+
     const code = Session.get();
     code ? this.showMain(code) : this.showWelcome();
+    if (code) this.handleQuickAdd(params);
+  }
+
+  // Verarbeitet ?add=Produkt: Eintrag hinzufügen. Ohne Wert wird nur das Eingabefeld geöffnet.
+  handleQuickAdd(params) {
+    if (!params.has("add")) return;
+    const text = (params.get("add") || "").trim();
+    this.select("shopping");
+    if (text) this.shopping.whenLoaded(() => this.shopping.add(text));
+    else this.shopping.input.focus();
+    history.replaceState(null, "", location.pathname); // Parameter aus der Adresse entfernen
+  }
+
+  // Verhindert versehentliches Zoomen per Pinch-Geste (Doppeltipp-Zoom blockiert das CSS)
+  disableZoom() {
+    ["gesturestart", "gesturechange", "gestureend"].forEach((t) =>
+      document.addEventListener(t, (e) => e.preventDefault()));
   }
 
   registerServiceWorker() {
@@ -472,7 +570,7 @@ class App {
     this.shopping.el.classList.toggle("hidden", tab !== "shopping");
     Object.entries(this.tabButtons).forEach(([k, b]) => b.classList.toggle("active", k === tab));
     this.title.textContent = tab === "tasks" ? "Haushalt" : "Einkaufsliste";
-    this.sub.textContent = tab === "tasks" ? "Dein Ordnungs-Überblick" : "Gemeinsam & live synchron";
+    this.sub.textContent = ""; // kein Untertitel
   }
 
   openSettings(code) {
