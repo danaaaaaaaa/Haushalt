@@ -5,7 +5,8 @@
 //    Repository       – alle Datenbankzugriffe (Firebase Firestore)
 //    ScoreCalculator  – Ampel- und Score-Berechnung
 //    Modal            – Dialog von unten
-//    ShoppingView     – Einkaufsliste inkl. Vorschläge
+//    Toast            – kurze Hinweismeldung
+//    ShoppingView     – Einkaufsliste inkl. Vorschläge und Gruppen
 //    TasksView        – Aufgaben, Ampel, Score
 //    App              – setzt alles zusammen
 // =====================================================================
@@ -80,7 +81,7 @@ class Session {
 }
 
 // =====================================================================
-//  Repository: Datenbankzugriff. Pfad: households/{code}/{items|suggestions|tasks}
+//  Repository: Datenbankzugriff. Pfad: households/{code}/{items|suggestions|groups|tasks}
 //  Schreibvorgänge werden nicht abgewartet, damit die App auch offline flüssig bleibt –
 //  Firestore sendet sie automatisch, sobald wieder Netz da ist.
 // =====================================================================
@@ -101,10 +102,11 @@ class Repository {
 
   fire(promise) { promise.catch((e) => Repository.report("Speichern fehlgeschlagen:", e)); }
 
-  // Live-Abo: callback wird bei jeder Änderung (auch von anderen iPhones) aufgerufen
+  // Live-Abo: callback(liste, ausCache) wird bei jeder Änderung (auch von anderen iPhones) aufgerufen.
+  // ausCache = true: noch nicht vom Server bestätigt (frisch geöffnet oder offline)
   listen(name, callback) {
-    const stop = onSnapshot(this.col(name), (snap) => {
-      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    const stop = onSnapshot(this.col(name), { includeMetadataChanges: true }, (snap) => {
+      callback(snap.docs.map((d) => ({ id: d.id, ...d.data() })), snap.metadata.fromCache);
     }, (err) => Repository.report("Lesefehler:", err));
     this.unsubscribers.push(stop);
   }
@@ -132,6 +134,11 @@ class Repository {
   updateTask(id, data) { this.fire(updateDoc(this.ref("tasks", id), data)); }
   completeTask(id) { this.fire(updateDoc(this.ref("tasks", id), { lastDone: Date.now() })); }
   deleteTask(id) { this.fire(deleteDoc(this.ref("tasks", id))); }
+
+  // --- Gruppen (z. B. "Essentials"): { name, items: [Produktnamen] } ---
+  addGroup(data) { this.fire(addDoc(this.col("groups"), { ...data, createdAt: Date.now() })); }
+  updateGroup(id, data) { this.fire(updateDoc(this.ref("groups", id), data)); }
+  deleteGroup(id) { this.fire(deleteDoc(this.ref("groups", id))); }
 }
 
 // =====================================================================
@@ -198,6 +205,7 @@ class ScoreCalculator {
 class Modal {
   static open(...content) {
     Modal.close();
+    document.getElementById("toast")?.classList.remove("show"); // Hinweis nicht über dem Dialog stehen lassen
     const sheet = h("div", { class: "sheet" });
     const overlay = h("div", { class: "overlay", id: "modal", onclick: (e) => { if (e.target === overlay) Modal.close(); } }, sheet);
     sheet.append(Modal.grabber(sheet, overlay), ...content);
@@ -239,13 +247,29 @@ class Modal {
 }
 
 // =====================================================================
-//  ShoppingView: Einkaufsliste mit lernenden Vorschlägen
+//  Toast: kurze Hinweismeldung über der Tab-Leiste
+// =====================================================================
+class Toast {
+  static timer = null;
+  static show(text) {
+    let el = document.getElementById("toast");
+    if (!el) { el = h("div", { class: "toast", id: "toast" }); document.body.append(el); }
+    el.textContent = text;
+    requestAnimationFrame(() => el.classList.add("show"));
+    clearTimeout(Toast.timer);
+    Toast.timer = setTimeout(() => el.classList.remove("show"), 2200);
+  }
+}
+
+// =====================================================================
+//  ShoppingView: Einkaufsliste mit lernenden Vorschlägen und Gruppen
 // =====================================================================
 class ShoppingView {
   constructor(repo) {
     this.repo = repo;
     this.items = [];
     this.suggestions = [];
+    this.groups = [];
     this.loaded = { items: false, suggestions: false }; // Daten schon eingetroffen?
     this.queue = [];                                    // wartende Aktionen (z. B. Schnell-Hinzufügen)
 
@@ -254,28 +278,46 @@ class ShoppingView {
     this.chipBox = h("div", { class: "chips" });
     this.chipTitle = h("div", { class: "section-title" });
     this.listBox = h("div", { class: "card" });
+    this.groupBox = h("div", { class: "chips" });
+    this.groupHead = h("div", { class: "section-head" },
+      h("span", { class: "section-title" }, "Gruppen"),
+      this.manageBtn = h("button", { class: "link-btn hidden", onclick: () => this.openGroupManager() }, "Verwalten"));
 
     this.el = h("section", { class: "content" },
       h("form", { class: "add-row", onsubmit: (e) => { e.preventDefault(); this.add(this.input.value); } },
         this.input, h("button", { class: "btn primary add-btn", type: "submit", "aria-label": "Hinzufügen" }, Icons.get("plus", 22))),
-      this.chipTitle, this.chipBox, this.listBox);
+      this.groupHead, this.groupBox, this.chipTitle, this.chipBox, this.listBox);
 
     this.render(); // sofort leeren Zustand zeigen, bis Daten eintreffen
-    repo.listen("items", (list) => {
-      this.items = list; this.loaded.items = true; this.render();
-      if (this.loaded.suggestions) this.flush();
+    repo.listen("items", (list, fromCache) => {
+      this.items = list;
+      if (!fromCache) this.loaded.items = true; // erst jetzt ist die Liste vollständig
+      this.render();
+      if (this.loaded.items && this.loaded.suggestions) this.flush();
     });
-    repo.listen("suggestions", (list) => {
-      this.suggestions = list; this.loaded.suggestions = true; this.renderChips();
-      if (this.loaded.items) this.flush();
+    repo.listen("groups", (list) => {
+      this.groups = list.sort((a, b) => a.createdAt - b.createdAt);
+      this.renderGroups();
     });
+    repo.listen("suggestions", (list, fromCache) => {
+      this.suggestions = list;
+      if (!fromCache) this.loaded.suggestions = true;
+      this.renderChips();
+      if (this.loaded.items && this.loaded.suggestions) this.flush();
+    });
+
+    // Antwortet der Server nicht (offline), nach 4 s trotzdem mit den lokalen Daten weiterarbeiten
+    setTimeout(() => {
+      this.loaded.items = this.loaded.suggestions = true;
+      this.render();
+      this.flush();
+    }, 4000);
   }
 
-  // Führt eine Aktion erst aus, wenn Liste und Vorschläge geladen sind (spätestens nach 3 s)
+  // Führt eine Aktion erst aus, wenn Liste und Vorschläge vom Server geladen sind
   whenLoaded(action) {
     if (this.loaded.items && this.loaded.suggestions) return action();
     this.queue.push(action);
-    setTimeout(() => this.flush(), 3000);
   }
   flush() {
     const waiting = this.queue;
@@ -283,19 +325,109 @@ class ShoppingView {
     waiting.forEach((action) => action());
   }
 
-  // Neuen Artikel hinzufügen (Doppelte auf der offenen Liste werden ignoriert)
-  add(text) {
+  // Fügt einen Artikel hinzu, sofern er nicht schon offen auf der Liste steht.
+  // Rückgabe: true = wirklich hinzugefügt
+  addItemByName(text) {
     let name = text.trim();
-    if (!name) return;
+    if (!name) return false;
     const key = Repository.suggestionKey(name);
     const known = this.suggestions.find((s) => s.id === key);
     if (known) name = known.name; // gelernte Schreibweise verwenden
     else name = name.charAt(0).toUpperCase() + name.slice(1);
     const open = this.items.some((i) => !i.done && Repository.suggestionKey(i.name) === key);
-    if (!open) this.repo.addItem(name);
+    if (open) return false;
+    this.repo.addItem(name);
+    return true;
+  }
+
+  // Eingabe aus dem Textfeld oder einem Vorschlag übernehmen
+  add(text) {
+    if (!text.trim()) return;
+    this.addItemByName(text);
     this.input.value = "";
     this.renderChips();
     this.input.focus();
+  }
+
+  // ----- Gruppen -----
+
+  // Alle Produkte einer Gruppe auf einmal hinzufügen (bereits offene werden übersprungen)
+  addGroup(group) {
+    const added = group.items.filter((name) => this.addItemByName(name)).length;
+    Toast.show(added
+      ? `${added} ${added === 1 ? "Produkt" : "Produkte"} aus „${group.name}“ hinzugefügt`
+      : `Alles aus „${group.name}“ steht schon auf der Liste`);
+  }
+
+  // Gruppen als Schnellwahl-Knöpfe über der Liste
+  renderGroups() {
+    this.manageBtn.classList.toggle("hidden", !this.groups.length);
+    if (!this.groups.length) { // noch keine Gruppe: Einstieg zum Anlegen anbieten
+      this.groupBox.replaceChildren(h("button", { class: "chip", onclick: () => this.openGroupEditor() },
+        "Gruppe anlegen, z. B. Essentials"));
+      return;
+    }
+    this.groupBox.replaceChildren(...this.groups.map((g) =>
+      h("button", { class: "chip group", onclick: () => this.addGroup(g) }, g.name, h("small", {}, String(g.items.length)))));
+  }
+
+  // Übersicht aller Gruppen zum Bearbeiten
+  openGroupManager() {
+    const rows = this.groups.map((g) =>
+      h("button", { class: "group-row", onclick: () => this.openGroupEditor(g) },
+        h("span", {}, h("strong", {}, g.name), h("small", {}, `${g.items.length} ${g.items.length === 1 ? "Produkt" : "Produkte"}`)),
+        Icons.get("edit", 18)));
+    Modal.open(
+      h("h3", {}, "Gruppen"),
+      ...(rows.length ? rows : [h("p", { class: "hint" }, "Noch keine Gruppen angelegt.")]),
+      h("button", { class: "btn primary block", onclick: () => this.openGroupEditor() }, Icons.get("plus", 20), "Neue Gruppe"));
+  }
+
+  // Dialog zum Anlegen (group = undefined) oder Bearbeiten einer Gruppe
+  openGroupEditor(group) {
+    const items = [...(group?.items ?? [])]; // Arbeitskopie, wird erst beim Speichern übernommen
+    const name = h("input", { type: "text", placeholder: "z. B. Essentials", value: group?.name ?? "", autocomplete: "off", autocapitalize: "sentences" });
+    const entry = h("input", { type: "text", placeholder: "Produkt hinzufügen", autocomplete: "off", autocapitalize: "sentences", enterkeyhint: "done" });
+    const list = h("div", { class: "chips" });
+
+    // Produkte der Gruppe anzeigen; Tippen entfernt das Produkt
+    const renderList = () => list.replaceChildren(...items.map((n, i) =>
+      h("button", { class: "chip removable", onclick: () => { items.splice(i, 1); renderList(); } }, n, Icons.get("close", 14))));
+    renderList();
+
+    // Eingabe in die Produktliste übernehmen (ohne Doppelte, mit gelernter Schreibweise)
+    const addEntry = (refocus = true) => {
+      let n = entry.value.trim();
+      if (!n) return;
+      const key = Repository.suggestionKey(n);
+      const known = this.suggestions.find((s) => s.id === key);
+      n = known ? known.name : n.charAt(0).toUpperCase() + n.slice(1);
+      if (!items.some((x) => Repository.suggestionKey(x) === key)) items.push(n);
+      entry.value = "";
+      renderList();
+      if (refocus) entry.focus();
+    };
+
+    const save = () => {
+      addEntry(false); // noch nicht bestätigte Eingabe nicht verlieren
+      const n = name.value.trim();
+      if (!n) return name.focus();
+      if (!items.length) return entry.focus();
+      const data = { name: n, items };
+      group ? this.repo.updateGroup(group.id, data) : this.repo.addGroup(data);
+      Modal.close();
+    };
+
+    Modal.open(
+      h("h3", {}, group ? "Gruppe bearbeiten" : "Neue Gruppe"),
+      h("div", { class: "field" }, h("label", {}, "Name"), name),
+      h("div", { class: "field" }, h("label", {}, "Produkte"), list,
+        h("form", { class: "inline-add", onsubmit: (e) => { e.preventDefault(); addEntry(); } },
+          entry, h("button", { class: "btn soft", type: "submit", "aria-label": "Produkt hinzufügen" }, Icons.get("plus", 20)))),
+      h("button", { class: "btn primary block", onclick: save }, "Speichern"),
+      group && h("button", { class: "btn danger block", onclick: () => {
+        if (confirm(`Gruppe „${group.name}“ wirklich löschen?`)) { this.repo.deleteGroup(group.id); Modal.close(); }
+      } }, "Löschen"));
   }
 
   // Vorschläge: beim Tippen passende, sonst die meistgekauften
@@ -318,7 +450,7 @@ class ShoppingView {
     const open = this.items.filter((i) => !i.done).sort((a, b) => a.createdAt - b.createdAt);
     const done = this.items.filter((i) => i.done).sort((a, b) => a.createdAt - b.createdAt);
     const rows = [...open, ...done].map((i) => this.row(i));
-    this.listBox.replaceChildren(...(rows.length ? rows : [h("div", { class: "empty" }, "Die Liste ist leer")]));
+    this.listBox.replaceChildren(...(rows.length ? rows : [h("div", { class: "empty" }, this.loaded.items ? "Die Liste ist leer" : "Liste wird geladen …")]));
     if (done.length) {
       this.listBox.append(h("button", { class: "btn soft block", style: "margin-top:10px",
         onclick: () => this.repo.clearDone(done.map((d) => d.id)) }, `Erledigte entfernen (${done.length})`));
@@ -545,7 +677,7 @@ class App {
       tasks: h("button", { class: "tab", onclick: () => this.select("tasks") }, Icons.get("tasks", 24), "Haushalt"),
       shopping: h("button", { class: "tab", onclick: () => this.select("shopping") }, Icons.get("cart", 24), "Einkauf")
     };
-    const tabbar = h("nav", { class: "tabbar" }, this.tabButtons.tasks, this.tabButtons.shopping);
+    const tabbar = h("nav", { class: "tabbar" }, this.tabButtons.shopping, this.tabButtons.tasks);
     this.offline = h("div", { class: "status hidden" }, "Offline");
 
     // Rotes Fehlerbanner (zeigt z. B. "permission-denied", wenn die Firestore-Regeln fehlen)
@@ -553,7 +685,7 @@ class App {
     Repository.onError = (text) => { this.errorBox.textContent = text; this.errorBox.classList.remove("hidden"); };
 
     this.root.replaceChildren(this.offline, this.errorBox, header, this.tasks.el, this.shopping.el, tabbar);
-    this.select(localStorage.getItem("haushalt-tab") || "tasks");
+    this.select("shopping"); // App startet immer mit der Einkaufsliste
 
     // Ampel regelmäßig aktualisieren (Zeit vergeht auch ohne Änderungen)
     setInterval(() => this.tasks.render(), 60000);
@@ -565,7 +697,6 @@ class App {
   }
 
   select(tab) {
-    localStorage.setItem("haushalt-tab", tab);
     this.tasks.el.classList.toggle("hidden", tab !== "tasks");
     this.shopping.el.classList.toggle("hidden", tab !== "shopping");
     Object.entries(this.tabButtons).forEach(([k, b]) => b.classList.toggle("active", k === tab));
