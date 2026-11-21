@@ -48,7 +48,9 @@ class Icons {
     plus: '<path d="M12 5v14M5 12h14"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
     close: '<path d="M6 6l12 12M18 6 6 18"/>',
-    edit: '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 8.5 3 3"/>'
+    edit: '<path d="M4 20h4L18.5 9.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="m13.5 8.5 3 3"/>',
+    info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+    tag: '<path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0L3 13V3h10l7.6 7.6a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/>'
   };
   // Liefert ein fertiges Element, Farbe folgt der Textfarbe (currentColor)
   static get(name, size = 22) {
@@ -122,6 +124,7 @@ class Repository {
   }
   setItemDone(id, done) { this.fire(updateDoc(this.ref("items", id), { done })); }
   deleteItem(id) { this.fire(deleteDoc(this.ref("items", id))); }
+  deleteSuggestion(id) { this.fire(deleteDoc(this.ref("suggestions", id))); }
   renameItem(id, name) { this.fire(updateDoc(this.ref("items", id), { name })); }
   clearDone(ids) {
     const batch = writeBatch(this.db);
@@ -205,7 +208,7 @@ class ScoreCalculator {
 class Modal {
   static open(...content) {
     Modal.close();
-    document.getElementById("toast")?.classList.remove("show"); // Hinweis nicht über dem Dialog stehen lassen
+    Toast.hide(true); // Hinweis nicht über dem Dialog stehen lassen
     const sheet = h("div", { class: "sheet" });
     const overlay = h("div", { class: "overlay", id: "modal", onclick: (e) => { if (e.target === overlay) Modal.close(); } }, sheet);
     sheet.append(Modal.grabber(sheet, overlay), ...content);
@@ -251,13 +254,23 @@ class Modal {
 // =====================================================================
 class Toast {
   static timer = null;
-  static show(text) {
-    let el = document.getElementById("toast");
-    if (!el) { el = h("div", { class: "toast", id: "toast" }); document.body.append(el); }
-    el.textContent = text;
+  // kind: "info" (Hinweis) oder "success" (Bestätigung). Verschwindet nach 5 Sekunden oder per Tipp.
+  static show(text, kind = "info") {
+    Toast.hide(true);
+    const el = h("div", { class: `toast ${kind}`, id: "toast", role: "status", onclick: () => Toast.hide() },
+      h("span", { class: "toast-icon" }, Icons.get(kind === "success" ? "check" : "info", 18)),
+      h("span", {}, text));
+    document.body.append(el);
     requestAnimationFrame(() => el.classList.add("show"));
+    Toast.timer = setTimeout(() => Toast.hide(), 5000);
+  }
+  static hide(immediately = false) {
     clearTimeout(Toast.timer);
-    Toast.timer = setTimeout(() => el.classList.remove("show"), 2200);
+    const el = document.getElementById("toast");
+    if (!el) return;
+    el.removeAttribute("id"); // ein neuer Toast darf nicht mit dem ausblendenden kollidieren
+    el.classList.remove("show");
+    immediately ? el.remove() : setTimeout(() => el.remove(), 300);
   }
 }
 
@@ -270,23 +283,27 @@ class ShoppingView {
     this.items = [];
     this.suggestions = [];
     this.groups = [];
+    this.groupKeys = new Set();   // Schlüssel aller Produkte, die in irgendeiner Gruppe stehen
+    this.editingChips = false;    // "Häufig gekauft" im Löschmodus?
     this.loaded = { items: false, suggestions: false }; // Daten schon eingetroffen?
     this.queue = [];                                    // wartende Aktionen (z. B. Schnell-Hinzufügen)
 
     this.input = h("input", { type: "text", placeholder: "Was wird gebraucht?", autocomplete: "off", autocapitalize: "sentences", enterkeyhint: "done" });
     this.input.addEventListener("input", () => this.renderChips());
     this.chipBox = h("div", { class: "chips" });
-    this.chipTitle = h("div", { class: "section-title" });
+    this.chipTitle = h("span", { class: "section-title" });
+    this.editBtn = h("button", { class: "link-btn", onclick: () => { this.editingChips = !this.editingChips; this.renderChips(); } }, "Bearbeiten");
+    this.chipHead = h("div", { class: "section-head" }, this.chipTitle, this.editBtn);
     this.listBox = h("div", { class: "card" });
     this.groupBox = h("div", { class: "chips" });
     this.groupHead = h("div", { class: "section-head" },
       h("span", { class: "section-title" }, "Gruppen"),
       this.manageBtn = h("button", { class: "link-btn hidden", onclick: () => this.openGroupManager() }, "Verwalten"));
 
-    this.el = h("section", { class: "content" },
-      h("form", { class: "add-row", onsubmit: (e) => { e.preventDefault(); this.add(this.input.value); } },
+    this.el = h("section", { class: "content shopping" },
+      h("form", { class: "add-row", onsubmit: (e) => { e.preventDefault(); this.add(this.input.value, true); } },
         this.input, h("button", { class: "btn primary add-btn", type: "submit", "aria-label": "Hinzufügen" }, Icons.get("plus", 22))),
-      this.groupHead, this.groupBox, this.chipTitle, this.chipBox, this.listBox);
+      this.groupHead, this.groupBox, this.chipHead, this.chipBox, this.listBox);
 
     this.render(); // sofort leeren Zustand zeigen, bis Daten eintreffen
     repo.listen("items", (list, fromCache) => {
@@ -297,7 +314,9 @@ class ShoppingView {
     });
     repo.listen("groups", (list) => {
       this.groups = list.sort((a, b) => a.createdAt - b.createdAt);
+      this.groupKeys = new Set(this.groups.flatMap((g) => g.items.map((n) => Repository.suggestionKey(n))));
       this.renderGroups();
+      this.render(); // Gruppen-Symbole in der Liste aktualisieren
     });
     repo.listen("suggestions", (list, fromCache) => {
       this.suggestions = list;
@@ -340,23 +359,24 @@ class ShoppingView {
     return true;
   }
 
-  // Eingabe aus dem Textfeld oder einem Vorschlag übernehmen
-  add(text) {
+  // Eingabe aus dem Textfeld oder einem Vorschlag übernehmen.
+  // refocus = true nur beim Tippen im Textfeld, damit die Tastatur bei Vorschlägen nicht aufgeht.
+  add(text, refocus = false) {
     if (!text.trim()) return;
     this.addItemByName(text);
     this.input.value = "";
     this.renderChips();
-    this.input.focus();
+    if (refocus) this.input.focus();
   }
 
   // ----- Gruppen -----
 
   // Alle Produkte einer Gruppe auf einmal hinzufügen (bereits offene werden übersprungen)
   addGroup(group) {
+    if (!group.items.length) return Toast.show(`Die Gruppe „${group.name}“ ist leer`);
     const added = group.items.filter((name) => this.addItemByName(name)).length;
-    Toast.show(added
-      ? `${added} ${added === 1 ? "Produkt" : "Produkte"} aus „${group.name}“ hinzugefügt`
-      : `Alles aus „${group.name}“ steht schon auf der Liste`);
+    if (added) Toast.show(`${added} ${added === 1 ? "Produkt" : "Produkte"} aus „${group.name}“ hinzugefügt`, "success");
+    else Toast.show(`Alles aus „${group.name}“ steht schon auf der Liste`);
   }
 
   // Gruppen als Schnellwahl-Knöpfe über der Liste
@@ -368,7 +388,7 @@ class ShoppingView {
       return;
     }
     this.groupBox.replaceChildren(...this.groups.map((g) =>
-      h("button", { class: "chip group", onclick: () => this.addGroup(g) }, g.name, h("small", {}, String(g.items.length)))));
+      h("button", { class: "chip group", onclick: () => this.addGroup(g) }, g.name, " ", h("span", { class: "count" }, String(g.items.length)))));
   }
 
   // Übersicht aller Gruppen zum Bearbeiten
@@ -442,8 +462,14 @@ class ShoppingView {
       list.sort((a, b) => b.count - a.count);
     }
     list = list.slice(0, 8);
-    this.chipTitle.textContent = list.length ? (q ? "Vorschläge" : "Häufig gekauft") : "";
-    this.chipBox.replaceChildren(...list.map((s) => h("button", { class: "chip", onclick: () => this.add(s.name) }, s.name)));
+    if (!list.length) this.editingChips = false;
+    this.chipHead.classList.toggle("hidden", !list.length);
+    this.chipTitle.textContent = q ? "Vorschläge" : "Häufig gekauft";
+    this.editBtn.textContent = this.editingChips ? "Fertig" : "Bearbeiten";
+    // Im Löschmodus entfernt ein Tipp den Vorschlag dauerhaft, sonst wird er zur Liste hinzugefügt
+    this.chipBox.replaceChildren(...list.map((s) => this.editingChips
+      ? h("button", { class: "chip removable", "aria-label": `${s.name} entfernen`, onclick: () => this.repo.deleteSuggestion(s.id) }, s.name, Icons.get("close", 14))
+      : h("button", { class: "chip", onclick: () => this.add(s.name) }, s.name)));
   }
 
   render() {
@@ -461,28 +487,58 @@ class ShoppingView {
   row(item) {
     return h("div", { class: "item" + (item.done ? " done" : "") },
       h("button", { class: "check", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.done ? Icons.get("check", 15) : null),
-      h("button", { class: "label", onclick: () => this.repo.setItemDone(item.id, !item.done) }, item.name),
+      h("button", { class: "label", onclick: () => this.repo.setItemDone(item.id, !item.done) },
+        item.name, this.groupKeys.has(Repository.suggestionKey(item.name)) ? Icons.get("tag", 14) : null),
       h("button", { class: "del", "aria-label": "Bearbeiten", onclick: () => this.openEditor(item) }, Icons.get("edit", 18)),
       h("button", { class: "del", "aria-label": "Löschen", onclick: () => this.repo.deleteItem(item.id) }, Icons.get("close", 18)));
   }
 
-  // Dialog zum Umbenennen eines Eintrags (leere Eingabe ändert nichts)
+  // Dialog zum Umbenennen eines Eintrags und zum Zuordnen zu Gruppen
   openEditor(item) {
     const input = h("input", { type: "text", value: item.name, autocomplete: "off", autocapitalize: "sentences", enterkeyhint: "done" });
+
+    // Gruppen, in denen das Produkt aktuell steht
+    const oldKey = Repository.suggestionKey(item.name);
+    const selected = new Set(this.groups
+      .filter((g) => g.items.some((n) => Repository.suggestionKey(n) === oldKey)).map((g) => g.id));
+    const groupChips = h("div", { class: "chips" });
+    const renderGroupChips = () => groupChips.replaceChildren(...this.groups.map((g) =>
+      h("button", { class: "chip toggle" + (selected.has(g.id) ? " on" : ""), onclick: () => {
+        selected.has(g.id) ? selected.delete(g.id) : selected.add(g.id);
+        renderGroupChips();
+      } }, selected.has(g.id) ? Icons.get("check", 14) : null, g.name)));
+    renderGroupChips();
+
     const save = () => {
       let name = input.value.trim();
       if (name) {
         name = name.charAt(0).toUpperCase() + name.slice(1);
         if (name !== item.name) this.repo.renameItem(item.id, name);
+      } else {
+        name = item.name; // leere Eingabe ändert den Namen nicht
       }
+      this.applyGroupSelection(item.name, name, selected);
       Modal.close();
     };
     Modal.open(
       h("h3", {}, "Eintrag bearbeiten"),
       h("form", { class: "field", onsubmit: (e) => { e.preventDefault(); save(); } }, input),
+      this.groups.length && h("div", { class: "field" }, h("label", {}, "Gruppen"), groupChips),
       h("button", { class: "btn primary block", onclick: save }, "Speichern"),
       h("button", { class: "btn block", onclick: () => Modal.close() }, "Abbrechen"));
     setTimeout(() => input.focus(), 50);
+  }
+
+  // Speichert die Gruppenzuordnung eines Produkts (beim Umbenennen bleibt die Zuordnung erhalten)
+  applyGroupSelection(oldName, newName, selected) {
+    const key = Repository.suggestionKey;
+    this.groups.forEach((g) => {
+      let items = g.items.map((n) => (key(n) === key(oldName) ? newName : n)); // Umbenennen
+      const has = items.some((n) => key(n) === key(newName));
+      if (selected.has(g.id) && !has) items.push(newName);
+      if (!selected.has(g.id)) items = items.filter((n) => key(n) !== key(newName));
+      if (items.join("\n") !== g.items.join("\n")) this.repo.updateGroup(g.id, { items });
+    });
   }
 }
 
